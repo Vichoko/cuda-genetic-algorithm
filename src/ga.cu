@@ -22,7 +22,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort =
 }
 
 // MACROS
-#define NUM_BLOCKS 216
+#define NUM_BLOCKS 128
 // GEFORCE GTX 960m has 640 blocks.
 #define THREADS_PER_BLOCK 4
 // Island is a block. Every individual is a thread.
@@ -31,13 +31,13 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort =
 #define ISLAND_POPULATION THREADS_PER_BLOCK
 // azucar sintactico
 
-#define MIGRATION_CHANCE 0.25
+#define MIGRATION_CHANCE 0.05
 //chance of migration ocurrs
 #define MIGRATION_SIZE 2
 // Quantity of the island individuals will migrate
-#define MUTATION_CHANCE 0.1
+#define MUTATION_CHANCE 0.01
 //chance of ocurring a mutation in genes
-#define CROSSOVER_CHANCE 0.5
+#define CROSSOVER_CHANCE 0.05
 
 // GLOBALS
 //device
@@ -96,19 +96,15 @@ __device__ int fitness_fun(unsigned char* actual_genes,
 		unsigned char res_byte = ~(a_byte ^ b_byte);
 
 		// now count bits in 1
-		while (res_byte > 0) {
-			if ((res_byte & 1) == 1) {
-				match_counter++;
-			}
-			res_byte >>= 1;
-		}
+		unsigned int res_int = (unsigned int) res_byte;
+		match_counter += __popc(res_int);
 	}
 	return match_counter;
 }
 
 __device__ void _migrate(int sorted_position, const unsigned int genes_len,
 		int localIndex, unsigned char* g_all_genes, unsigned char* s_genes,
-		int* s_fitness, unsigned char* g_expected_genes) {
+		int* s_fitness, unsigned char* s_expected_genes) {
 	//sorted_position is the index where this gene should be located if population is sorted descending
 	/*** BEGIN CRITICAL SECTION; evaluate if use mutex ***/
 	/** MIGRATION_SIZE threads copy best elements to Global Memory **/
@@ -146,7 +142,7 @@ __device__ void _migrate(int sorted_position, const unsigned int genes_len,
 //Device
 __device__ void migrate_best_genes(int localIndex, const unsigned int genes_len,
 		int* migrate_flag, int* s_fitness, unsigned char* g_all_genes,
-		unsigned char* s_genes, unsigned char* g_expected_genes) {
+		unsigned char* s_genes, unsigned char* s_expected_genes) {
 	/** If migrate, the top MIGRATION_SIZE individuals goes to other island,
 	 * and worst MIGRATION_SIZE individuals get replaced by other island's */
 	if (*migrate_flag) {
@@ -173,7 +169,7 @@ __device__ void migrate_best_genes(int localIndex, const unsigned int genes_len,
 		/*** BEGIN CRITICAL SECTION; evaluate if use mutex ***/
 		/** MIGRATION_SIZE threads copy best elements to Global Memory **/
 		_migrate(sorted_position, genes_len, localIndex, g_all_genes, s_genes,
-				s_fitness, g_expected_genes);
+				s_fitness, s_expected_genes);
 		/*** END CRITICAL SECTION; evaluate if using mutex ***/
 		__syncthreads(); // wait every thread to finish, then restore migrate_flag
 		*migrate_flag = 0;
@@ -202,9 +198,6 @@ __device__ void crossover(int dad, int mom, unsigned char* son_genes,
 	unsigned int random3 = curand(&state); //32 bits of pure randomness
 	unsigned int mom_or_dad = random2 % 2;
 
-	if (!(random != random2 || random != random3)) {
-		printf("nod ??????? dif\n");
-	} // todo: delete
 
 	if (random < CROSSOVER_CHANCE * UINT_MAX) {
 		// do two-point cross over
@@ -222,10 +215,10 @@ __device__ void crossover(int dad, int mom, unsigned char* son_genes,
 		memcpy(son_genes, &s_genes[(mom_or_dad ? mom : dad) * genes_len],
 				sizeof(unsigned char) * p1); // first segment, 0 to p1-1, inclusive
 
-		memcpy(son_genes, &s_genes[(mom_or_dad ? dad : mom) * genes_len + p1],
+		memcpy(&son_genes[p1], &s_genes[(mom_or_dad ? dad : mom) * genes_len + p1],
 				sizeof(unsigned char) * (p2 - p1)); // second, p1 to p2-1, inc
 
-		memcpy(son_genes, &s_genes[(mom_or_dad ? mom : dad) * genes_len + p2],
+		memcpy(&son_genes[p2], &s_genes[(mom_or_dad ? mom : dad) * genes_len + p2],
 				sizeof(unsigned char) * (genes_len - p2)); // third, p2 to genes_len-1
 
 	} else {
@@ -264,9 +257,10 @@ __global__ void island_controller(const unsigned int genes_len,
 	extern __shared__ int shared_array[];
 	int* s_fitness = shared_array;
 	unsigned char* s_genes = (unsigned char*) &s_fitness[ISLAND_POPULATION];
-	unsigned char* s_son_genes = (unsigned char*) &s_genes[ISLAND_POPULATION
-			* genes_len];
-	int* migrate_flag = (int*) &s_son_genes[ISLAND_POPULATION * genes_len];
+	unsigned char* s_son_genes = (unsigned char*) &s_genes[ISLAND_POPULATION* genes_len];
+	int* migrate_flag = (int*) &s_son_genes[ISLAND_POPULATION* genes_len];
+	unsigned char* s_expected_genes = (unsigned char*) &migrate_flag[1];
+
 
 	int globalIndex = blockIdx.x * blockDim.x + threadIdx.x; // indice del individuo/thread
 	int localIndex = threadIdx.x;
@@ -284,19 +278,33 @@ __global__ void island_controller(const unsigned int genes_len,
 		int island_genes_len = genes_len * ISLAND_POPULATION;
 		memcpy(s_genes, &g_all_genes[blockIdx.x * island_genes_len],
 				sizeof(unsigned char) * island_genes_len);
+		memcpy(s_expected_genes, g_expected_genes,
+				sizeof(unsigned char) * genes_len);
 		//initial conditions
 		*migrate_flag = 0;
 	}
 	__syncthreads();
 
 	/** Evolution loop */
-	unsigned int last_gen = 100;
+	unsigned int last_gen = 1000;
 
 	while (*g_finish_signal == 0 && last_gen--) { // todo: while cuando se cambie la flag
 		/** Update fitness in Shared memory */
+
 		unsigned char* genes = &s_genes[localIndex * genes_len];
-		s_fitness[localIndex] = fitness_fun(genes, g_expected_genes, genes_len);
+		s_fitness[localIndex] = fitness_fun(genes, s_expected_genes, genes_len);
+
+		/** BEGIN CRITICAL SECTION **/
+		if (s_fitness[localIndex] >= genes_len * 8 && *g_finish_signal == 0) { // fitness is number of common bits
+			*g_finish_signal = 1;
+			memcpy(g_best_genes, genes, sizeof(unsigned char) * genes_len);
+			break;
+		}
+		/** END CRITICAL SECTION **/
 		__syncthreads();
+		if (*g_finish_signal){
+			break;
+		}
 
 		/** Migrate? Yes or No */
 		if (localIndex == 0) {
@@ -307,45 +315,31 @@ __global__ void island_controller(const unsigned int genes_len,
 			}
 		}
 		__syncthreads(); // all threads wait for the migrate_flag update
-
 		/** Wit a chance, migrate the top MIGRATION_SIZE individuals to other island,
 		 * and worst MIGRATION_SIZE individuals get replaced by other island's best */
 		migrate_best_genes(localIndex, genes_len, migrate_flag, s_fitness,
-				g_all_genes, s_genes, g_expected_genes);
+			g_all_genes, s_genes, s_expected_genes);
 		__syncthreads();
 
 		// select two parents for new individual, this thread is in charge of that son
 		int dad = tournament_selection(3, state, s_fitness);
 		int mom = tournament_selection(3, state, s_fitness);
-		__syncthreads();
+		printf("fitness medio %d\n", s_fitness[dad]>s_fitness[mom] ? s_fitness[dad] : s_fitness[mom]);
 
 		unsigned char* son_genes = &s_son_genes[localIndex * genes_len];
 		crossover(dad, mom, son_genes, s_genes, genes_len, state);
 		//son_genes contain crossed over genes of dad and mom
+		//mutate(son_genes, genes_len, state);
 		__syncthreads();
 
-		mutate(son_genes, genes_len, state);
-		__syncthreads();
-
-		memcpy(&s_genes[localIndex * genes_len], son_genes,
+		memcpy(&s_genes[localIndex * genes_len],
+				son_genes,
 				sizeof(unsigned char) * genes_len);
-		s_fitness[localIndex] = fitness_fun(son_genes, g_expected_genes,
-				genes_len); //actualizar genes y fitness en shared memory
-
-		/** BEGIN CRITICAL SECTION **/
-		if (s_fitness[localIndex] >= genes_len * 8 && *g_finish_signal == 0) { // fitness is number of common bits
-			*g_finish_signal = 1;
-			memcpy(g_best_genes, son_genes, sizeof(unsigned char) * genes_len);
-			break;
-		}
-		/** END CRITICAL SECTION **/
 	}
 }
 
-__global__ void generate_initial_population(
-		const unsigned int genes_len,
-		unsigned char* all_genes,
-		unsigned int seed) {
+__global__ void generate_initial_population(const unsigned int genes_len,
+		unsigned char* all_genes, unsigned int seed) {
 	// cada thread se encarga de generarse a si mismo y colocarse en memoria principal de GPU.
 	int globalIndex = blockIdx.x * blockDim.x + threadIdx.x; // indice del individuo/thread
 	/* CUDA's random number library uses curandState_t to keep track of the seed value
@@ -419,6 +413,7 @@ __host__ unsigned char* run_evolution() {
 	/** need to store island genes and fitnesses **/
 	int shared_mem_size = sizeof(unsigned char) * genes_len * ISLAND_POPULATION; // for parent genes
 	shared_mem_size += sizeof(unsigned char) * genes_len * ISLAND_POPULATION; // for son genes
+	shared_mem_size += sizeof(unsigned char)* genes_len; // for expected genes
 	shared_mem_size += sizeof(int) * ISLAND_POPULATION; // for fitnesses
 	shared_mem_size += sizeof(int); // for migration flag
 
@@ -431,10 +426,10 @@ __host__ unsigned char* run_evolution() {
 	>>>(genes_len, d_all_genes, d_best_genes, d_finish_signal, time(NULL), // random seed
 	verbose, //todo: delete
 			d_expected_genes); //custom param
+	gpuErrchk(cudaThreadSynchronize());
 
 	gpuErrchk(cudaPeekAtLastError());
 
-	gpuErrchk(cudaThreadSynchronize());
 	//gpuErrchk(cudaDeviceSynchronize());
 	// if im here, perfect individual should exist
 
@@ -443,6 +438,7 @@ __host__ unsigned char* run_evolution() {
 	gpuErrchk(
 			cudaMemcpy(best_genes, d_best_genes,
 					sizeof(unsigned char) * genes_len, cudaMemcpyDeviceToHost));
+	gpuErrchk(cudaThreadSynchronize());
 
 	printf("	Evolution finished.\n");
 	return best_genes; // Todo: asegurar que sea el individuo perfecto
@@ -472,8 +468,10 @@ unsigned char* d_all_genes_test;
 int __init_test_resources() {
 	genes_len_test = 100;
 
-	shared_mem_size = sizeof(unsigned char) * genes_len_test * ISLAND_POPULATION; // for parent genes
-	shared_mem_size += sizeof(unsigned char) * genes_len_test * ISLAND_POPULATION; // for son genes
+	shared_mem_size =
+			sizeof(unsigned char) * genes_len_test * ISLAND_POPULATION; // for parent genes
+	shared_mem_size += sizeof(unsigned char) * genes_len_test
+			* ISLAND_POPULATION; // for son genes
 	shared_mem_size += sizeof(int) * ISLAND_POPULATION; // for fitnesses
 	shared_mem_size += sizeof(int); // for migration flag
 
@@ -488,19 +486,13 @@ int __init_test_resources() {
 
 int population_test() {
 	generate_initial_population<<<
-			NUM_BLOCKS,
-			ISLAND_POPULATION>>>(
-					genes_len_test,
-					d_all_genes_test,
-					time(NULL));
+	NUM_BLOCKS,
+	ISLAND_POPULATION>>>(genes_len_test, d_all_genes_test, time(NULL));
 	gpuErrchk(cudaDeviceSynchronize());
 	gpuErrchk(cudaPeekAtLastError());
 
 	gpuErrchk(
-			cudaMemcpy(
-					all_genes_test,
-					d_all_genes_test,
-					total_genes_size,
+			cudaMemcpy(all_genes_test, d_all_genes_test, total_genes_size,
 					cudaMemcpyDeviceToHost));
 	gpuErrchk(cudaDeviceSynchronize());
 
@@ -514,10 +506,8 @@ int population_test() {
 	return 0;
 }
 
-__global__ void _migration_test_kernel(
-		const unsigned int genes_len,
-		unsigned char* g_all_genes,
-		unsigned char* g_this_genes,
+__global__ void _migration_test_kernel(const unsigned int genes_len,
+		unsigned char* g_all_genes, unsigned char* g_this_genes,
 		const unsigned int island_id) {
 	//initialization
 	extern __shared__ int shared_array[];
@@ -547,9 +537,9 @@ __global__ void _migration_test_kernel(
 		__syncthreads();
 
 		// modify the MIGRATION_SIZE first individuals
-		if (localIndex< MIGRATION_SIZE){
-			for (int i= 0; i< genes_len; i++){
-				s_genes[localIndex* genes_len + i] = localIndex % 256;
+		if (localIndex < MIGRATION_SIZE) {
+			for (int i = 0; i < genes_len; i++) {
+				s_genes[localIndex * genes_len + i] = localIndex % 256;
 			}
 		}
 		*migrate_flag = 1;
@@ -561,8 +551,7 @@ __global__ void _migration_test_kernel(
 
 		__syncthreads();
 		if (localIndex == 0) {
-			memcpy(g_this_genes,
-					s_genes,
+			memcpy(g_this_genes, s_genes,
 					sizeof(unsigned char) * island_genes_len);
 		}
 		__syncthreads();
@@ -573,7 +562,8 @@ int _migration_test() {
 
 	// shared vs global device memory consistency test
 	unsigned int island_id_a = 1;
-	unsigned char* h_a_genes = (unsigned char*) malloc(genes_size* ISLAND_POPULATION);
+	unsigned char* h_a_genes = (unsigned char*) malloc(
+			genes_size * ISLAND_POPULATION);
 	unsigned char* d_a_genes;
 	gpuErrchk(cudaMalloc(&d_a_genes, genes_size* ISLAND_POPULATION));
 
@@ -586,51 +576,51 @@ int _migration_test() {
 	gpuErrchk(cudaPeekAtLastError());
 
 	gpuErrchk(
-			cudaMemcpy(
-					h_a_genes,
-					d_a_genes,
-					genes_size* ISLAND_POPULATION,
-					cudaMemcpyDeviceToHost));
+			cudaMemcpy( h_a_genes, d_a_genes, genes_size* ISLAND_POPULATION, cudaMemcpyDeviceToHost));
 	gpuErrchk(
-			cudaMemcpy(all_genes_test, d_all_genes_test, genes_size* TOTAL_POPULATION,
-					cudaMemcpyDeviceToHost));
+			cudaMemcpy(all_genes_test, d_all_genes_test, genes_size* TOTAL_POPULATION, cudaMemcpyDeviceToHost));
 	gpuErrchk(cudaDeviceSynchronize());
 
 	// check if last MIGRATION_SIZE* genes_len_test elements are equal al neighbor first elements
 	for (int i = 0; i < MIGRATION_SIZE * genes_len_test; i++) {
-		if (h_a_genes[(ISLAND_POPULATION-MIGRATION_SIZE)* genes_len_test + i]
-				!= all_genes_test[(island_id_a+ 1)* genes_len_test * ISLAND_POPULATION + i]) {
+		if (h_a_genes[(ISLAND_POPULATION - MIGRATION_SIZE) * genes_len_test + i]
+				!= all_genes_test[(island_id_a + 1) * genes_len_test
+						* ISLAND_POPULATION + i]) {
 			return -1;
+		}
+	}
+
+	// shared vs global test
+	for (int i = 0; i < MIGRATION_SIZE * genes_len_test; i++) {
+		if (h_a_genes[i]
+				!= all_genes_test[island_id_a * genes_len_test
+						* ISLAND_POPULATION + i]) {
+			return 1;
 		}
 	}
 
 	// edit persistence in global memory test
 	unsigned int island_id_b = 0;
-	unsigned char* h_b_genes = (unsigned char*) malloc(genes_size* ISLAND_POPULATION);
+	unsigned char* h_b_genes = (unsigned char*) malloc(
+			genes_size * ISLAND_POPULATION);
 	unsigned char* d_b_genes;
 	gpuErrchk(cudaMalloc(&d_b_genes, genes_size* ISLAND_POPULATION));
 	_migration_test_kernel<<<NUM_BLOCKS, 	// NUMBER OF ISLANDS
-				ISLAND_POPULATION, // ISLAND_POPULATION
-				shared_mem_size // tamaño de memoria compartida
-		>>>(genes_len_test, d_all_genes_test, d_b_genes, island_id_b);
+			ISLAND_POPULATION, // ISLAND_POPULATION
+			shared_mem_size // tamaño de memoria compartida
+	>>>(genes_len_test, d_all_genes_test, d_b_genes, island_id_b);
 	gpuErrchk(cudaDeviceSynchronize());
 	gpuErrchk(cudaPeekAtLastError());
 
 	gpuErrchk(
-			cudaMemcpy(
-					h_b_genes,
-					d_b_genes,
-					genes_size* ISLAND_POPULATION,
-					cudaMemcpyDeviceToHost));
+			cudaMemcpy( h_b_genes, d_b_genes, genes_size* ISLAND_POPULATION, cudaMemcpyDeviceToHost));
 	gpuErrchk(
-			cudaMemcpy(all_genes_test, d_all_genes_test, genes_size* TOTAL_POPULATION,
-					cudaMemcpyDeviceToHost));
+			cudaMemcpy(all_genes_test, d_all_genes_test, genes_size* TOTAL_POPULATION, cudaMemcpyDeviceToHost));
 	gpuErrchk(cudaDeviceSynchronize());
-
 
 	// check if last MIGRATION_SIZE* genes_len_test elements are equal al neighbor first elements just modified
 	for (int i = 0; i < MIGRATION_SIZE * genes_len_test; i++) {
-		if (h_b_genes[(ISLAND_POPULATION-MIGRATION_SIZE)* genes_len_test + i]
+		if (h_b_genes[(ISLAND_POPULATION - MIGRATION_SIZE) * genes_len_test + i]
 				!= h_a_genes[i]) {
 			return -2;
 		}
@@ -638,35 +628,31 @@ int _migration_test() {
 
 	//border case test
 	unsigned int island_id_c = 0;
-	unsigned char* h_c_genes = (unsigned char*) malloc(genes_size* ISLAND_POPULATION);
+	unsigned char* h_c_genes = (unsigned char*) malloc(
+			genes_size * ISLAND_POPULATION);
 	unsigned char* d_c_genes;
 	gpuErrchk(cudaMalloc(&d_c_genes, genes_size* ISLAND_POPULATION));
 	_migration_test_kernel<<<NUM_BLOCKS, 	// NUMBER OF ISLANDS
-				ISLAND_POPULATION, // ISLAND_POPULATION
-				shared_mem_size // tamaño de memoria compartida
-		>>>(genes_len_test, d_all_genes_test, d_c_genes, island_id_c);
+			ISLAND_POPULATION, // ISLAND_POPULATION
+			shared_mem_size // tamaño de memoria compartida
+	>>>(genes_len_test, d_all_genes_test, d_c_genes, island_id_c);
 	gpuErrchk(cudaDeviceSynchronize());
 	gpuErrchk(cudaPeekAtLastError());
 
 	gpuErrchk(
-			cudaMemcpy(
-					h_c_genes,
-					d_c_genes,
-					genes_size* ISLAND_POPULATION,
-					cudaMemcpyDeviceToHost));
+			cudaMemcpy( h_c_genes, d_c_genes, genes_size* ISLAND_POPULATION, cudaMemcpyDeviceToHost));
 	gpuErrchk(
-			cudaMemcpy(all_genes_test, d_all_genes_test, genes_size* TOTAL_POPULATION,
-					cudaMemcpyDeviceToHost));
+			cudaMemcpy(all_genes_test, d_all_genes_test, genes_size* TOTAL_POPULATION, cudaMemcpyDeviceToHost));
 	gpuErrchk(cudaDeviceSynchronize());
 
 	// check if last MIGRATION_SIZE* genes_len_test elements are equal al neighbor first elements just modified
 	for (int i = 0; i < MIGRATION_SIZE * genes_len_test; i++) {
-		if (h_c_genes[(ISLAND_POPULATION-MIGRATION_SIZE)* genes_len_test + i]
+		if (h_c_genes[(ISLAND_POPULATION - MIGRATION_SIZE) * genes_len_test + i]
 				!= h_b_genes[i]) {
 			return -3;
 		}
 
-		if (h_c_genes[(ISLAND_POPULATION-MIGRATION_SIZE)* genes_len_test + i]
+		if (h_c_genes[(ISLAND_POPULATION - MIGRATION_SIZE) * genes_len_test + i]
 				!= all_genes_test[i]) {
 			return -4;
 		}
@@ -677,8 +663,110 @@ int _migration_test() {
 int tournament_selection_test() {
 
 	return 0;
+
 }
-int crossover_test() {
+
+__global__ void _crossover_test_kernel(
+		const unsigned int genes_len,
+		unsigned char* g_all_genes,
+		unsigned int seed,
+		unsigned char* g_this_genes,
+		const unsigned int island_id
+		) {
+	if (blockIdx.x == island_id) {
+		extern __shared__ int shared_array[];
+		int* s_fitness = shared_array;
+		unsigned char* s_genes = (unsigned char*) &s_fitness[ISLAND_POPULATION];
+		unsigned char* s_son_genes = (unsigned char*) &s_genes[ISLAND_POPULATION
+				* genes_len];
+		int* migrate_flag = (int*) &s_son_genes[ISLAND_POPULATION * genes_len];
+
+		int globalIndex = blockIdx.x * blockDim.x + threadIdx.x; // indice del individuo/thread
+		int localIndex = threadIdx.x;
+		int island_genes_len = genes_len * ISLAND_POPULATION;
+
+
+		/* CUDA's random number library */
+		curandState_t state;
+		curand_init(seed, /* the seed controls the sequence of random values that are produced */
+		(globalIndex + 1), /* the sequence number is only important with multiple cores */
+		genes_len, /* the offset is how much extra we advance in the sequence for each call, can be 0 */
+		&state);
+
+		/* copy genes from Global Memory (generate_initial_population) to Shared */
+		if (localIndex == 0) {
+			// one thread copy all the island genes to shared memory
+			memcpy(s_genes, &g_all_genes[blockIdx.x * island_genes_len],
+					sizeof(unsigned char) * island_genes_len);
+			//initial conditions
+			*migrate_flag = 0;
+		}
+
+		//unsigned char* genes = &s_genes[localIndex * genes_len];
+		//s_fitness[localIndex] = fitness_fun(genes, g_expected_genes, genes_len);
+		__syncthreads();
+
+		// select two parents for new individual, this thread is in charge of that son
+		//int dad = tournament_selection(3, state, s_fitness);
+		//int mom = tournament_selection(3, state, s_fitness);
+		int dad = localIndex; //has to be deterministic for testing
+		int mom = (localIndex < blockDim.x-1) ? localIndex+1 : 0;
+		__syncthreads();
+
+		unsigned char* son_genes = &s_son_genes[localIndex * genes_len];
+		crossover(dad, mom, son_genes, s_genes, genes_len, state);
+		//son_genes contain crossed over genes of dad and mom
+		__syncthreads();
+		memcpy(&s_genes[localIndex * genes_len], son_genes,
+				sizeof(unsigned char) * genes_len);
+		__syncthreads();
+		if (localIndex == 0) {
+			memcpy(g_this_genes, s_genes,
+					sizeof(unsigned char) * island_genes_len);
+		}
+		__syncthreads();
+
+
+	}
+}
+
+int _crossover_test() {
+	// shared vs global device memory consistency test
+	unsigned int island_id_a = 0;
+	unsigned char* h_a_genes = (unsigned char*) malloc(
+			genes_size * ISLAND_POPULATION);
+	unsigned char* d_a_genes;
+	gpuErrchk(cudaMalloc(&d_a_genes, genes_size* ISLAND_POPULATION));
+
+	_crossover_test_kernel<<<NUM_BLOCKS, 	// NUMBER OF ISLANDS
+			ISLAND_POPULATION, // ISLAND_POPULATION
+			shared_mem_size // tamaño de memoria compartida
+	>>>(genes_len_test, d_all_genes_test, time(NULL), d_a_genes, island_id_a);
+	gpuErrchk(cudaDeviceSynchronize());
+
+	gpuErrchk(cudaPeekAtLastError());
+
+	gpuErrchk(
+			cudaMemcpy( h_a_genes, d_a_genes, genes_size* ISLAND_POPULATION, cudaMemcpyDeviceToHost));
+	gpuErrchk(
+			cudaMemcpy(all_genes_test, d_all_genes_test, genes_size* TOTAL_POPULATION, cudaMemcpyDeviceToHost));
+	gpuErrchk(cudaDeviceSynchronize());
+
+	for (int individual= 0; individual< ISLAND_POPULATION; individual++){
+		for (int gene= 0; gene< genes_len_test; gene++){
+			int son_index = individual*genes_len_test;
+			int dad_index = (ISLAND_POPULATION* island_id_a+ individual)* genes_len_test;
+			int mom_index = individual >= ISLAND_POPULATION -1 ? 0 : (ISLAND_POPULATION* island_id_a+ individual+ 1)* genes_len_test;
+
+
+			if (h_a_genes[son_index + gene] != all_genes_test[dad_index+ gene] &&
+					h_a_genes[individual*genes_len_test + gene] != all_genes_test[mom_index+ gene]){
+				return -1;
+			}
+		}
+
+	}
+
 
 	return 0;
 }
@@ -713,7 +801,7 @@ int __run_tests() {
 	}
 	printf("pass tournament_selection_test\n");
 
-	if ((err = crossover_test())) {
+	if ((err = _crossover_test())) {
 		printf("crossover_test error %d\n", err);
 		exit(err);
 	}
@@ -721,6 +809,12 @@ int __run_tests() {
 
 	if ((err = mutation_test())) {
 		printf("mutation_test error %d\n", err);
+		exit(err);
+	}
+	printf("pass mutation_test\n");
+
+	if ((err = fitness_test())) { //todo: check if fitness gets better, if t higher comapring withe xpected shit you kno
+		printf("fitness_test error %d\n", err);
 		exit(err);
 	}
 	printf("pass mutation_test\n");
@@ -734,16 +828,23 @@ int __run_tests() {
 // MAIN
 // CPU Controller
 int main() {
-	/*	printf("Started CUDA GA.\n");
-	 init_resources();
-	 init_population();
+	int test_mode = 0;
+	if (!test_mode){
+		printf("Started CUDA GA.\n");
+		 init_resources();
+		 init_population();
 
-	 unsigned char* evoluted_genes = run_evolution();
-	 FILE* file = fopen("evoluted_img.bmp", "wb");
-	 fwrite(evoluted_genes, 1, genes_len, file);*/
+		 unsigned char* evoluted_genes = run_evolution();
+		 FILE* file = fopen("evoluted_img.bmp", "wb");
+		 fwrite(evoluted_genes, 1, genes_len, file);
 
-	printf("Started CUDA GA - TEST SUITE\n");
-	int res = __run_tests();
-	printf("Finished tests\n");
-	return res;
+	} else{
+		printf("Started CUDA GA - TEST SUITE\n");
+		int res = __run_tests();
+		printf("Finished tests\n");
+		return res;
+	}
+
+
+
 }
