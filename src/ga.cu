@@ -77,8 +77,10 @@ __host__ unsigned char* file_to_byte_array(const char* filename) { // TODO: add 
 	return buffer;
 }
 
-__device__ int fitness_fun(unsigned char* actual_genes,
-		unsigned char* expected_genes, int genes_len) {
+__device__ int fitness_fun(
+		unsigned char* actual_genes,
+		unsigned char* expected_genes,
+		int genes_len) {
 	if (actual_genes == NULL) {
 		printf("actual genes are NULL\n");
 		return 1;
@@ -98,6 +100,7 @@ __device__ int fitness_fun(unsigned char* actual_genes,
 		// now count bits in 1
 		unsigned int res_int = (unsigned int) res_byte;
 		match_counter += __popc(res_int);
+
 	}
 	return match_counter;
 }
@@ -775,6 +778,83 @@ int mutation_test() {
 	return 0;
 }
 
+__global__ void _fitness_test_kernel(unsigned char* expected_genes, unsigned char* actual_genes, const int genes_size, int* ftnss_ptr){
+	if (blockIdx.x == 0){
+		if (threadIdx.x == 0){
+			*ftnss_ptr = fitness_fun(actual_genes, expected_genes, genes_size);
+		}
+	}
+}
+
+unsigned char* d_e_genes;
+unsigned char* d_a_genes;
+int* ftnss_ptr;
+int* d_ftnss_ptr;
+
+void _fitness_test_init_resources(){
+	ftnss_ptr = (int*)malloc(sizeof(int));
+	gpuErrchk( cudaMalloc(&d_e_genes, genes_size));
+	gpuErrchk( cudaMalloc(&d_a_genes, genes_size));
+	gpuErrchk( cudaMalloc(&d_ftnss_ptr, sizeof(int)));
+
+}
+
+void _fitness_test_release_resources(){
+	//gpuErrchk( cudaFree(&d_e_genes));
+	//gpuErrchk( cudaFree(&d_a_genes));
+	//gpuErrchk( cudaFree(&d_ftnss_ptr));
+}
+
+int _fitness_test_kernel_wrapper(unsigned char* expected_genes, unsigned char* actual_genes, const int genes_size){
+	gpuErrchk( cudaMemcpy(d_e_genes, expected_genes, genes_size, cudaMemcpyHostToDevice));
+	gpuErrchk( cudaMemcpy(d_a_genes, actual_genes, genes_size, cudaMemcpyHostToDevice));
+
+	 _fitness_test_kernel<<<1,1>>>(d_e_genes, d_a_genes, genes_size, d_ftnss_ptr);
+	gpuErrchk( cudaPeekAtLastError());
+	gpuErrchk( cudaMemcpy(ftnss_ptr, d_ftnss_ptr, sizeof(int), cudaMemcpyDeviceToHost));
+	gpuErrchk( cudaDeviceSynchronize());
+
+
+	return *ftnss_ptr;
+
+
+}
+int _fitness_test(){
+	_fitness_test_init_resources();
+	// fitness use acual_genes, expected_gene, gene_size and calcuates fitness (int; more is better).
+	unsigned char expected_genes[4] = {0xff, 0xff, 0xff, 0xff};
+	unsigned char actual_genes_a[4] = {0,0,0,0};
+
+	int min_fitness = _fitness_test_kernel_wrapper(actual_genes_a, expected_genes, 4);
+	if (min_fitness != 0){
+		return -1;
+	}
+
+	int max_fitness = _fitness_test_kernel_wrapper(expected_genes, expected_genes, 4);
+	int max_fitness2 = _fitness_test_kernel_wrapper(actual_genes_a, actual_genes_a, 4);
+
+	if (max_fitness != 4*8){
+		return -2;
+	}
+	if (max_fitness != max_fitness2){
+		return -3;
+	}
+	unsigned char expected_genes_b[4] = {0xAA,0xAA,0xAA,0xAA}; //10101010
+	unsigned char actual_genes_b[4] = {0x55,0x55,0x55,0x55}; //01010101
+
+	if (_fitness_test_kernel_wrapper(actual_genes_b, expected_genes_b, 4) != 0){
+		return -4;
+	}
+	if (_fitness_test_kernel_wrapper(expected_genes_b, expected_genes_b, 4) != 4*8){
+		return -5;
+	}
+	if (_fitness_test_kernel_wrapper(expected_genes_b, expected_genes_b, 4) != _fitness_test_kernel_wrapper(actual_genes_b, actual_genes_b, 4)){
+		return -6;
+	}
+	_fitness_test_release_resources();
+	return 0;
+}
+
 int __run_tests() {
 	int err = 0;
 
@@ -813,7 +893,7 @@ int __run_tests() {
 	}
 	printf("pass mutation_test\n");
 
-	if ((err = fitness_test())) { //todo: check if fitness gets better, if t higher comapring withe xpected shit you kno
+	if ((err = _fitness_test())) { //todo: check if fitness gets better, if t higher comapring withe xpected shit you kno
 		printf("fitness_test error %d\n", err);
 		exit(err);
 	}
