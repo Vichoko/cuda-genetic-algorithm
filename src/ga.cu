@@ -22,7 +22,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort =
 }
 
 // MACROS
-#define NUM_BLOCKS 1024
+#define NUM_BLOCKS 128
 // GEFORCE GTX 960m has 640 blocks.
 #define THREADS_PER_BLOCK 512
 // Island is a block. Every individual is a thread.
@@ -31,7 +31,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort =
 #define ISLAND_POPULATION THREADS_PER_BLOCK
 // azucar sintactico
 
-#define MIGRATION_CHANCE 0.3
+#define MIGRATION_CHANCE 0.2
 //chance of migration ocurrs
 #define MIGRATION_SIZE 128
 // Quantity of the island individuals will migrate
@@ -339,7 +339,7 @@ __global__ void island_controller(const unsigned int genes_len,
 			}
 		}
 		__syncthreads(); // all threads wait for the migrate_flag update
-		/** Wit a chance, migrate the top MIGRATION_SIZE individuals to other island,
+		/** With a chance, migrate the top MIGRATION_SIZE individuals to other island,
 		 * and worst MIGRATION_SIZE individuals get replaced by other island's best */
 		migrate_best_genes(localIndex, genes_len, migrate_flag, s_fitness,
 				g_all_genes, s_genes, s_expected_genes);

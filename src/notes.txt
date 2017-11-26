@@ -1,0 +1,6 @@
+Mas tamaño de migracion, mas rapido converge.
+Un k menor, en la seleccion por torneo previene overfit.
+Probabilidad de mutacion tiene que ser igual a Cantidad de bloques/Cantidad de generaciones por ronda.
+
+Configuracion que converge en 14000 usa prob 1 de mutacion y cross over. 128 tamaño de migracion de 128; 512 bloques y threads por bloque.
+
